@@ -1,0 +1,63 @@
+name: Pull Request Validation
+
+on:
+  pull_request:
+    branches:
+      - main
+      - 'release/**'
+
+jobs:
+  validate:
+    name: Validate PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r app/requirements.txt
+          pip install -r app/requirements-dev.txt
+
+      - name: Lint with Ruff
+        run: ruff check app/
+
+      - name: Format check with Black
+        run: black --check app/
+
+      - name: Run tests
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-fail-under=80 \
+            -v
+        env:
+          DATABASE_URL: sqlite:///./test.db
+          APP_ENV: test
+
+      - name: Validate Helm chart
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          helm lint helm/fastapi-app/
+
+      - name: Validate Terraform formatting
+        run: |
+          # Checks that IaC changes in PR are properly formatted
+          if [ -d "terraform/" ]; then
+            terraform fmt -check -recursive terraform/
+          fi
+
+      - name: Check for hardcoded secrets (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

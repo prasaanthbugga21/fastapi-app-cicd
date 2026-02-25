@@ -1,0 +1,286 @@
+name: CI/CD Pipeline — FastAPI Application
+
+on:
+  push:
+    branches:
+      - main
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: fastapi-app
+  EKS_CLUSTER_NAME: prod-eks-cluster
+  HELM_RELEASE_NAME: fastapi-app
+  HELM_CHART_PATH: ./helm/fastapi-app
+
+jobs:
+  # -------------------------------------------------------
+  # JOB 1: Lint & Test
+  # -------------------------------------------------------
+  lint-and-test:
+    name: Lint, Test & Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r app/requirements.txt
+          pip install -r app/requirements-dev.txt
+
+      - name: Run Ruff linter
+        run: ruff check app/
+
+      - name: Run Black formatter check
+        run: black --check app/
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --junitxml=test-results.xml \
+            -v
+        env:
+          DATABASE_URL: sqlite:///./test.db
+          APP_ENV: test
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            test-results.xml
+            coverage.xml
+
+      - name: Dependency vulnerability scan (Snyk)
+        uses: snyk/actions/python@master
+        continue-on-error: false
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high --file=app/requirements.txt
+
+  # -------------------------------------------------------
+  # JOB 2: Build & Push Container Image
+  # -------------------------------------------------------
+  build-and-push:
+    name: Build & Push to Amazon ECR
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          IMAGE_TAG="${GITHUB_SHA::8}"
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg GIT_COMMIT=${{ github.sha }} \
+            --tag ${{ steps.meta.outputs.image_uri }} \
+            --tag ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest \
+            --file docker/Dockerfile \
+            .
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Push image to ECR
+        run: |
+          docker push ${{ steps.meta.outputs.image_uri }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+
+  # -------------------------------------------------------
+  # JOB 3: Deploy to Staging
+  # -------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging (EKS)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment:
+      name: staging
+      url: https://staging.fastapi-app.internal
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name staging-eks-cluster
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.14.0'
+
+      - name: Deploy to staging via Helm
+        run: |
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ${{ env.HELM_CHART_PATH }} \
+            --namespace staging \
+            --create-namespace \
+            --set image.repository=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+            --set image.tag=${{ needs.build-and-push.outputs.image_tag }} \
+            --set environment=staging \
+            --set replicaCount=2 \
+            --values helm/fastapi-app/values-staging.yaml \
+            --wait \
+            --timeout 5m \
+            --atomic
+
+      - name: Run smoke tests against staging
+        run: |
+          STAGING_URL="https://staging.fastapi-app.internal"
+          echo "Running smoke tests against ${STAGING_URL}"
+          bash scripts/smoke-test.sh "${STAGING_URL}"
+
+  # -------------------------------------------------------
+  # JOB 4: Deploy to Production (Canary)
+  # -------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production (Canary → Full Rollout)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://fastapi-app.company.com
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig for production EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: '3.14.0'
+
+      - name: Deploy canary (10% traffic)
+        run: |
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }}-canary ${{ env.HELM_CHART_PATH }} \
+            --namespace production \
+            --set image.repository=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+            --set image.tag=${{ needs.build-and-push.outputs.image_tag }} \
+            --set environment=production \
+            --set canary.enabled=true \
+            --set canary.weight=10 \
+            --values helm/fastapi-app/values-production.yaml \
+            --wait \
+            --timeout 5m
+
+      - name: Monitor canary health (5 minutes)
+        run: |
+          echo "Monitoring canary deployment for 5 minutes..."
+          bash scripts/canary-health-check.sh \
+            --namespace production \
+            --release ${{ env.HELM_RELEASE_NAME }}-canary \
+            --duration 300 \
+            --error-threshold 1
+
+      - name: Promote canary to full production rollout
+        run: |
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} ${{ env.HELM_CHART_PATH }} \
+            --namespace production \
+            --set image.repository=${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }} \
+            --set image.tag=${{ needs.build-and-push.outputs.image_tag }} \
+            --set environment=production \
+            --set replicaCount=5 \
+            --set canary.enabled=false \
+            --values helm/fastapi-app/values-production.yaml \
+            --wait \
+            --timeout 10m \
+            --atomic
+
+      - name: Remove canary release
+        if: success()
+        run: helm uninstall ${{ env.HELM_RELEASE_NAME }}-canary --namespace production
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "✅ *Production deployment succeeded*\n*App:* fastapi-app\n*Version:* ${{ needs.build-and-push.outputs.image_tag }}\n*Deployed by:* ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "🚨 *Production deployment FAILED — rollback initiated*\n*App:* fastapi-app\n*Version:* ${{ needs.build-and-push.outputs.image_tag }}\n*Triggered by:* ${{ github.actor }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
